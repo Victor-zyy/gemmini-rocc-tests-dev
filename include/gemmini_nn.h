@@ -131,9 +131,11 @@ static void tiled_matmul_nn_auto(size_t dim_I, size_t dim_J, size_t dim_K,
         enum tiled_matmul_type_t tiled_matmul_type,
         bool check, char * layer_name)
 {
-    if (check)
+    if (check) {
         printf("%s: gemmini\n", layer_name);
+    }
 
+    // this function is in include/gemmini.h file
     tiled_matmul_auto(dim_I, dim_J, dim_K,
         (elem_t*)A, (elem_t*)B, D, (elem_t*)C,
         dim_K, dim_J, dim_J, dim_J,
@@ -144,7 +146,7 @@ static void tiled_matmul_nn_auto(size_t dim_I, size_t dim_J, size_t dim_K,
         0,
         tiled_matmul_type);
 
-    if (check) {
+    if (check) { //have no idea of why to go to this code bracket
         printf("%s: CPU\n", layer_name);
         elem_t gold[dim_I][dim_J];
         tiled_matmul_auto(dim_I, dim_J, dim_K,

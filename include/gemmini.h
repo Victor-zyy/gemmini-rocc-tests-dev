@@ -61,6 +61,7 @@
 #define k_LOOP_WS_CONFIG_SPAD_AB 24
 #define k_LOOP_WS_CONFIG_SPAD_C 25
 
+// sub command when func7 is k_CONFIG
 #define CONFIG_EX 0
 #define CONFIG_LD 1
 #define CONFIG_ST 2
@@ -75,6 +76,8 @@
 #define LAYERNORM 2
 #define IGELU 3
 #define SOFTMAX 4
+//zynex-add
+#define SILU 5
 
 #ifdef ELEM_T_IS_FLOAT
 static elem_t elem_t_bits_to_elem_t(elem_t_bits x) {
@@ -726,6 +729,11 @@ static void tiled_matmul_outer(size_t dim_I, size_t dim_J, size_t dim_K,
         uint8_t weightA,
         int dataflow) {
 
+  //zynex-add for SILU
+  int sys_act = act & 3;
+  if (act == SILU) {
+    sys_act = 0;
+  }
   const size_t dim_I_padded = (dim_I / DIM + (dim_I % DIM != 0)) * DIM;
   const size_t dim_J_padded = (dim_J / DIM + (dim_J % DIM != 0)) * DIM;
   const size_t dim_K_padded = (dim_K / DIM + (dim_K % DIM != 0)) * DIM;
@@ -755,7 +763,12 @@ static void tiled_matmul_outer(size_t dim_I, size_t dim_J, size_t dim_K,
   const size_t sizeof_D = low_D ? sizeof(elem_t) : sizeof(acc_t) ;
   const size_t sizeof_C = full_C ? sizeof(acc_t) : sizeof(elem_t);
 
-  gemmini_extended_config_ex(dataflow, act & 3, 0, 1, a_transpose, b_transpose);
+  //zynex-debug
+  //printf("main calculate function layer\r\n");
+  //printf("act input is %d\r\n", act);
+  // configure the excution pipeline
+//#define gemmini_extended_config_ex(dataflow, sys_act, sys_shift, A_stride, A_transpose, B_transpose)
+  gemmini_extended_config_ex(dataflow, sys_act & 3, 0, 1, a_transpose, b_transpose);
   gemmini_extended_config_st(stride_C * sizeof_C, act & 3, scale);
   gemmini_extended3_config_ld(stride_A * sizeof(elem_t), A_scale_factor, false, 0);
   gemmini_extended3_config_ld(stride_B * sizeof(elem_t), B_scale_factor, false, 1)
@@ -785,8 +798,18 @@ static void tiled_matmul_outer(size_t dim_I, size_t dim_J, size_t dim_K,
     gemmini_config_norm(qln2, 0, 0, 1, 0, qb, qc);
     gemmini_config_norm(qln2_inv, 1, 0, 1, 0, qb, qc);
   }
-
-  void (*inner)(const elem_t *, const elem_t *, const void *, void *,
+  //zynex-add
+  if (act == SILU) {
+    /*
+     * SILU = 5 = 0b101.
+     *
+     * config_st has already set act[1:0] = act & 3 = 1.
+     * Here config_norm is used only to set act[2] = 1.
+     * This does not mean we are doing LayerNorm.
+     */
+    gemmini_config_norm(0, 0, 0, 1, 0, 0, 0);
+  }
+    void (*inner)(const elem_t *, const elem_t *, const void *, void *,
         scale_t, scale_t, scale_acc_t,
         size_t, size_t, size_t, size_t, size_t, size_t,
         size_t, size_t, size_t, size_t,
@@ -1309,6 +1332,7 @@ _STATIC void tiled_matmul_auto(size_t dim_I, size_t dim_J, size_t dim_K,
     while (true) {
       bool increased = false;
 
+      // tiled_matmul_total_spad_rows calculate the size
       if (tiled_matmul_total_spad_rows(tile_I, tile_J+1, tile_K) <= max_spad_rows &&
           tiled_matmul_total_acc_rows(tile_I, tile_J+1) <= max_acc_rows &&
           (tile_J+1) * DIM <= dim_J_padded) {
