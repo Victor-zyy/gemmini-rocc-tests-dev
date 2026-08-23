@@ -304,6 +304,41 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
 #define gemmini_config_norm(q_const, q_const_type, set_stats_id_only, act_msb, stat_id, igelu_qb, igelu_qc) \
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, (((uint64_t) ((uint32_t) q_const)) << 32) | ((q_const_type & 1) << 18) | ((set_stats_id_only & 1) << 17) | ((act_msb & 1) << 16) | ((uint64_t)stat_id << 8) | CONFIG_BERT, ((uint64_t)((uint32_t)(igelu_qc)) << 32) | ((uint64_t)((uint32_t)(igelu_qb))), k_CONFIG)
 
+// Two-scale SiLU store pipeline prototype.
+// scale_to_mid converts an INT32 accumulator to signed INT8 q_mid. The LUT
+// then maps the q_mid bit pattern to the final signed INT8 q_out. Eight table
+// entries are packed into each CONFIG_NORM command, so one layer costs 32
+// configuration commands.
+#define gemmini_config_silu_lut8(chunk, packed_entries) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)((chunk) & 0x1f) << 20) | ((uint64_t)1 << 19) | CONFIG_BERT, (uint64_t)(packed_entries), k_CONFIG)
+
+static void gemmini_load_silu_lut(const elem_t lut[256]) {
+  // The LUT sidecar deliberately has no dependency on accumulator/LoopConv
+  // control. Retire all older accelerator memory traffic before replacing the
+  // table so legacy datapaths retain their original handshake and latency.
+  asm volatile("fence" ::: "memory");
+  for (size_t chunk = 0; chunk < 32; chunk++) {
+    uint64_t packed = 0;
+    for (size_t i = 0; i < 8; i++)
+      packed |= (uint64_t)(uint8_t)lut[chunk * 8 + i] << (i * 8);
+    gemmini_config_silu_lut8(chunk, packed);
+  }
+}
+
+static void gemmini_extended_config_st_twoscale_silu_loaded(
+    size_t stride, acc_scale_t scale_to_mid) {
+  // Only the low two activation bits belong in CONFIG_ST. Passing SILU (5)
+  // directly would also set pool_stride bit 4.
+  gemmini_extended_config_st(stride, SILU & 3, scale_to_mid);
+  gemmini_config_norm(0, 0, 0, 1, 0, 0, 0);
+}
+
+static void gemmini_extended_config_st_twoscale_silu(
+    size_t stride, acc_scale_t scale_to_mid, const elem_t lut[256]) {
+  gemmini_load_silu_lut(lut);
+  gemmini_extended_config_st_twoscale_silu_loaded(stride, scale_to_mid);
+}
+
 // flush
 #define gemmini_flush(skip) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, skip, 0, k_FLUSH)
@@ -3638,4 +3673,3 @@ _STATIC void tiled_norm_auto(const size_t I, const size_t J,
 #undef abs
 
 #endif // SRC_MAIN_C_GEMMINI_H
-

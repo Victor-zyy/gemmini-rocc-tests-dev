@@ -82,4 +82,6 @@ typedef uint32_t acc_scale_t_bits;
 
 #define HAS_FIRST_LAYER_OPTIMIZATIONS
 
+#define HAS_SILU_LUT
+
 #endif // GEMMINI_PARAMS_H
