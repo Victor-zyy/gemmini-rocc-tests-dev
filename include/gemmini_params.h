@@ -84,4 +84,6 @@ typedef uint32_t acc_scale_t_bits;
 
 #define HAS_SILU_LUT
 
+#define HAS_EXACT_RESADD
+
 #endif // GEMMINI_PARAMS_H

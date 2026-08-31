@@ -11,6 +11,7 @@
 #include <math.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <assert.h>
 
 #include "include/gemmini_params.h"
 
@@ -78,6 +79,7 @@
 #define SOFTMAX 4
 //zynex-add
 #define SILU 5
+#define EXACT_RESADD 6
 
 #ifdef ELEM_T_IS_FLOAT
 static elem_t elem_t_bits_to_elem_t(elem_t_bits x) {
@@ -280,6 +282,22 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
 #define gemmini_extended4_config_ld(stride, scale, shrunk, block_mvin_stride, id) \
   gemmini_extended5_config_ld(stride, scale, shrunk, block_mvin_stride, 1, id) \
 
+// Exact ResAdd scale payload: signed 26-bit multiplier plus a 6-bit shift.
+// This is consumed only when LOOP_WS exact_resadd (rs2[10]) is set; legacy
+// CONFIG_LD continues to interpret these bits as the configured scale_t.
+static inline uint32_t gemmini_exact_resadd_scale_bits(
+    int32_t multiplier, uint32_t shift) {
+  const int32_t min_multiplier = -(INT32_C(1) << 25);
+  const int32_t max_multiplier =  (INT32_C(1) << 25) - 1;
+  assert(multiplier >= min_multiplier && multiplier <= max_multiplier);
+  assert(shift < 64);
+  return ((shift & UINT32_C(0x3f)) << 26) |
+    ((uint32_t)multiplier & UINT32_C(0x03ffffff));
+}
+
+#define gemmini_extended4_config_ld_exact(stride, multiplier, shift, block_mvin_stride, id) \
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)gemmini_exact_resadd_scale_bits((multiplier), (shift)) << 32) | ((uint64_t)(block_mvin_stride) << 16) | ((uint64_t)1 << 8) | ((id) << 3) | ((uint64_t)1 << 2) | CONFIG_LD, stride, k_CONFIG)
+
 #define gemmini_extended3_config_ld(stride, scale, shrunk, id) \
   gemmini_extended4_config_ld(stride, scale, shrunk, DIM, id)
 
@@ -337,6 +355,12 @@ static void gemmini_extended_config_st_twoscale_silu(
     size_t stride, acc_scale_t scale_to_mid, const elem_t lut[256]) {
   gemmini_load_silu_lut(lut);
   gemmini_extended_config_st_twoscale_silu_loaded(stride, scale_to_mid);
+}
+
+static inline void gemmini_extended_config_st_exact_resadd(size_t stride) {
+  gemmini_extended_config_st(stride, EXACT_RESADD & 3,
+    ACC_SCALE_IDENTITY);
+  gemmini_config_norm(0, 0, 0, 1, 0, 0, 0);
 }
 
 // flush
@@ -409,6 +433,18 @@ static int ceil_divide_int(int a, int b){
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB) \
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, D_stride, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC) \
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(a_spad_id) << 18) | ((uint64_t)(b_spad_id) << 16) | ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((is_resadd) << 2) | ((B_transpose) << 1) | (A_transpose), k_LOOP_WS) \
+  }
+
+// Backward-compatible exact residual mode. rs2[2] retains the legacy ResAdd
+// selector while rs2[10] opts the two mvin streams into INT32 fixed scaling.
+#define gemmini_loop_ws_exact_resadd(I, J, pad_I, pad_J, A, B, C, A_stride, B_stride, C_stride) \
+  { \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, NULL, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, 0, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)EXACT_RESADD << 8), ((uint64_t)1 << 10) | ((uint64_t)1 << 2), k_LOOP_WS) \
   }
 
 #define gemmini_loop_ws_spad(I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, a_spad_id, b_spad_id, is_resadd, skips) \
