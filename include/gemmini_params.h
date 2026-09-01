@@ -86,4 +86,6 @@ typedef uint32_t acc_scale_t_bits;
 
 #define HAS_EXACT_RESADD
 
+#define HAS_EXACT_GATHER
+
 #endif // GEMMINI_PARAMS_H

@@ -62,6 +62,14 @@
 #define k_LOOP_WS_CONFIG_SPAD_AB 24
 #define k_LOOP_WS_CONFIG_SPAD_C 25
 
+// Experimental Exact Gather-Requant command family. These funct values are
+// outside the legacy Gemmini/LoopConv ranges and are modeled by libgemmini
+// before the corresponding RTL loop controller is introduced.
+#define k_EXACT_GATHER_CONFIG_BOUNDS 26
+#define k_EXACT_GATHER_CONFIG_BRANCH 27
+#define k_EXACT_GATHER_CONFIG_SCALE 28
+#define k_EXACT_GATHER 29
+
 // sub command when func7 is k_CONFIG
 #define CONFIG_EX 0
 #define CONFIG_LD 1
@@ -294,6 +302,124 @@ static inline uint32_t gemmini_exact_resadd_scale_bits(
   return ((shift & UINT32_C(0x3f)) << 26) |
     ((uint32_t)multiplier & UINT32_C(0x03ffffff));
 }
+
+#ifdef HAS_EXACT_GATHER
+#define GEMMINI_EXACT_GATHER_MAX_BRANCHES 4
+#ifndef GEMMINI_EXACT_GATHER_MAX_FRAGMENTS_PER_COMMAND
+#define GEMMINI_EXACT_GATHER_MAX_FRAGMENTS_PER_COMMAND 4096
+#endif
+
+struct gemmini_exact_gather_branch {
+  const elem_t *src;
+  uint16_t src_stride;
+  uint16_t channels;
+  uint16_t dst_offset;
+  int32_t multiplier;
+  uint8_t shift;
+};
+
+static inline void gemmini_config_exact_gather_bounds(
+    uintptr_t dst, uint16_t rows, uint16_t cols, uint16_t dst_stride,
+    uint8_t branch_count, bool dst_spad) {
+  assert(rows > 0 && cols > 0);
+  assert(branch_count > 0 && branch_count <= GEMMINI_EXACT_GATHER_MAX_BRANCHES);
+  assert(dst_stride >= (dst_spad ? DIM : cols));
+  const uint64_t packed = (uint64_t)rows |
+    ((uint64_t)cols << 16) |
+    ((uint64_t)dst_stride << 32) |
+    ((uint64_t)branch_count << 48) |
+    ((uint64_t)dst_spad << 51);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, dst, packed,
+    k_EXACT_GATHER_CONFIG_BOUNDS);
+}
+
+static inline void gemmini_config_exact_gather_branch(
+    uint8_t branch_id, const elem_t *src, uint16_t src_stride,
+    uint16_t channels, uint16_t dst_offset) {
+  assert(branch_id < GEMMINI_EXACT_GATHER_MAX_BRANCHES);
+  assert(src != NULL && channels > 0 && src_stride >= channels);
+  const uint64_t packed = (uint64_t)src_stride |
+    ((uint64_t)channels << 16) |
+    ((uint64_t)dst_offset << 32) |
+    ((uint64_t)branch_id << 48);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, src, packed,
+    k_EXACT_GATHER_CONFIG_BRANCH);
+}
+
+static inline void gemmini_config_exact_gather_scale(
+    uint8_t branch_id, int32_t multiplier, uint8_t shift) {
+  assert(branch_id < GEMMINI_EXACT_GATHER_MAX_BRANCHES);
+  const uint32_t packed =
+    gemmini_exact_resadd_scale_bits(multiplier, shift);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, packed, branch_id,
+    k_EXACT_GATHER_CONFIG_SCALE);
+}
+
+static inline void gemmini_exact_gather_execute(void) {
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, 0, 0, k_EXACT_GATHER);
+}
+
+static inline void gemmini_exact_gather_issue_rows(
+    uintptr_t dst, uint16_t row_base, uint16_t row_count,
+    uint16_t cols, uint16_t dst_stride,
+    const struct gemmini_exact_gather_branch *branches,
+    uint8_t branch_count, bool dst_spad) {
+  const uintptr_t chunk_dst = dst_spad ? dst :
+    dst + (uintptr_t)row_base * dst_stride * sizeof(elem_t);
+
+  gemmini_config_exact_gather_bounds(chunk_dst, row_count, cols, dst_stride,
+    branch_count, dst_spad);
+  for (uint8_t branch = 0; branch < branch_count; branch++) {
+    const struct gemmini_exact_gather_branch *b = &branches[branch];
+    const elem_t *chunk_src = b->src +
+      (size_t)row_base * b->src_stride;
+
+    gemmini_config_exact_gather_branch(branch, chunk_src, b->src_stride,
+      b->channels, b->dst_offset);
+    gemmini_config_exact_gather_scale(branch, b->multiplier, b->shift);
+  }
+  gemmini_exact_gather_execute();
+}
+
+static inline void gemmini_loop_exact_gather(
+    uintptr_t dst, uint16_t rows, uint16_t cols, uint16_t dst_stride,
+    const struct gemmini_exact_gather_branch *branches,
+    uint8_t branch_count, bool dst_spad) {
+  assert(rows > 0 && branches != NULL);
+  assert(branch_count > 0 && branch_count <= GEMMINI_EXACT_GATHER_MAX_BRANCHES);
+
+  // The Spike-only scratchpad destination retains its original single-command
+  // contract. Native RTL currently accepts DRAM destinations only.
+  if (dst_spad) {
+    gemmini_exact_gather_issue_rows(dst, 0, rows, cols, dst_stride,
+      branches, branch_count, true);
+    return;
+  }
+
+  uint32_t fragments_per_row = 0;
+  for (uint8_t branch = 0; branch < branch_count; branch++) {
+    const struct gemmini_exact_gather_branch *b = &branches[branch];
+
+    assert(b->channels > 0);
+    fragments_per_row += (b->channels + DIM - 1) / DIM;
+  }
+
+  uint32_t rows_per_command =
+    GEMMINI_EXACT_GATHER_MAX_FRAGMENTS_PER_COMMAND / fragments_per_row;
+  if (rows_per_command == 0)
+    rows_per_command = 1;
+
+  for (uint32_t row_base = 0; row_base < rows;) {
+    const uint32_t rows_left = (uint32_t)rows - row_base;
+    const uint16_t chunk_rows = (uint16_t)(
+      rows_left < rows_per_command ? rows_left : rows_per_command);
+
+    gemmini_exact_gather_issue_rows(dst, (uint16_t)row_base, chunk_rows,
+      cols, dst_stride, branches, branch_count, false);
+    row_base += chunk_rows;
+  }
+}
+#endif
 
 #define gemmini_extended4_config_ld_exact(stride, multiplier, shift, block_mvin_stride, id) \
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)gemmini_exact_resadd_scale_bits((multiplier), (shift)) << 32) | ((uint64_t)(block_mvin_stride) << 16) | ((uint64_t)1 << 8) | ((id) << 3) | ((uint64_t)1 << 2) | CONFIG_LD, stride, k_CONFIG)
